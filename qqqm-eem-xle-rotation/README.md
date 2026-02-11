@@ -1,6 +1,6 @@
 # QQQM / EEM / XLE Monthly Rotation Tool
 
-This tool implements the monthly, month-end-only strategy you specified:
+This tool implements the monthly, month-end-only strategy:
 - SMA10 trend filter on month-end prices only
 - 6-month momentum for ranking among trend-ON ETFs
 - Default hold when there is no change event (no forced risk-off)
