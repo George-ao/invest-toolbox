@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
+import argparse
 from pathlib import Path
-import pandas as pd
-import yfinance as yf
+try:
+    import pandas as pd
+    import yfinance as yf
+except ImportError:
+    pd = None
+    yf = None
 
-TICKERS = ["QQQM", "EEM", "XLE"]
+DEFAULT_TICKERS = ["QQQM", "EEM", "XLE"]
 ROTATE_THRESHOLD = 0.03
 MOMENTUM_MONTHS = 6
 REBASE_MONTHS = 36
@@ -11,6 +16,30 @@ DELTA = 0.10
 FLOOR = 0.10
 CAP = 0.60
 REQUIRE_TWO_MONTH_CONFIRMATION = False
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Generate month-end rotation signals for an ETF set."
+    )
+    parser.add_argument(
+        "--tickers",
+        nargs="+",
+        default=DEFAULT_TICKERS,
+        help="ETF symbols to rotate across.",
+    )
+    return parser.parse_args()
+
+
+def normalize_tickers(raw_tickers):
+    tickers = []
+    for ticker in raw_tickers:
+        symbol = str(ticker).strip().upper()
+        if symbol and symbol not in tickers:
+            tickers.append(symbol)
+    if len(tickers) < 2:
+        raise SystemExit("At least two unique tickers are required.")
+    return tickers
 
 
 def fetch_month_end_prices(tickers):
@@ -58,9 +87,9 @@ def donor_key(ticker, trend_row, momentum_row):
     return (trend_rank, momentum_row[ticker])
 
 
-def suggest_action(leader, trend_row, momentum_row):
+def suggest_action(leader, trend_row, momentum_row, tickers):
     candidates = [
-        t for t in TICKERS if t != leader and not pd.isna(momentum_row[t])
+        t for t in tickers if t != leader and not pd.isna(momentum_row[t])
     ]
     if not candidates:
         return None, "no_donor"
@@ -68,7 +97,7 @@ def suggest_action(leader, trend_row, momentum_row):
     return {"from": candidates[0], "to": leader, "amount": DELTA}, None
 
 
-def simulate(monthly, trend_on, momentum12):
+def simulate(monthly, trend_on, momentum12, tickers):
     prev_leader = None
     prev_top = None
     decisions = []
@@ -119,7 +148,7 @@ def simulate(monthly, trend_on, momentum12):
                     change_reason = "confirm_not_met"
 
         if change_event:
-            action, block_reason = suggest_action(top, row_trend, row_mom)
+            action, block_reason = suggest_action(top, row_trend, row_mom, tickers)
             if action:
                 prev_leader = top
             else:
@@ -154,8 +183,8 @@ def format_pct(value):
     return f"{value * 100:.2f}%"
 
 
-def rebased_window(monthly, months):
-    prices = monthly[TICKERS].copy()
+def rebased_window(monthly, months, tickers):
+    prices = monthly[tickers].copy()
     if months:
         prices = prices.tail(months)
     prices = prices.dropna(how="any")
@@ -186,18 +215,27 @@ def build_plot_meta(decisions):
     return pd.DataFrame(rows).set_index("date")
 
 
-def save_visualization(monthly, sma10, trend_on, decisions, output_path, leader, change_event):
+def save_visualization(
+    monthly,
+    sma10,
+    trend_on,
+    decisions,
+    output_path,
+    leader,
+    change_event,
+    tickers,
+):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    data_n, base = rebased_window(monthly, REBASE_MONTHS)
+    data_n, base = rebased_window(monthly, REBASE_MONTHS, tickers)
     if data_n.empty or base is None:
         raise RuntimeError("Not enough overlapping data to rebase.")
 
-    sma_window = sma10.loc[data_n.index, TICKERS]
+    sma_window = sma10.loc[data_n.index, tickers]
     sma_n = sma_window.divide(base) * 100
     meta = build_plot_meta(decisions).reindex(data_n.index)
 
@@ -208,11 +246,19 @@ def save_visualization(monthly, sma10, trend_on, decisions, output_path, leader,
         sharex=True,
         gridspec_kw={"height_ratios": [3, 1]},
     )
-    palette = {
-        "QQQM": "#1f77b4",
-        "EEM": "#ff7f0e",
-        "XLE": "#2ca02c",
-    }
+    default_colors = [
+        "#1f77b4",
+        "#ff7f0e",
+        "#2ca02c",
+        "#d62728",
+        "#9467bd",
+        "#8c564b",
+        "#e377c2",
+        "#7f7f7f",
+        "#bcbd22",
+        "#17becf",
+    ]
+    palette = {t: default_colors[idx % len(default_colors)] for idx, t in enumerate(tickers)}
     for dt, leader_month in meta["leader"].items():
         if pd.isna(leader_month):
             continue
@@ -221,7 +267,7 @@ def save_visualization(monthly, sma10, trend_on, decisions, output_path, leader,
         end = dt.to_period("M").end_time
         ax_main.axvspan(start, end, color=color, alpha=0.08, lw=0)
 
-    for idx, t in enumerate(TICKERS):
+    for idx, t in enumerate(tickers):
         ax_main.plot(
             data_n.index,
             data_n[t],
@@ -282,7 +328,7 @@ def save_visualization(monthly, sma10, trend_on, decisions, output_path, leader,
         color="#666666",
     )
     ax_main.grid(True, linestyle="--", linewidth=0.4, alpha=0.5)
-    ax_main.legend(ncol=3, frameon=False)
+    ax_main.legend(ncol=min(4, max(2, len(tickers))), frameon=False)
 
     diff_series = pd.to_numeric(meta["diff"], errors="coerce") * 100
     ax_aux.plot(
@@ -319,8 +365,23 @@ def save_visualization(monthly, sma10, trend_on, decisions, output_path, leader,
 
 
 def main():
+    args = parse_args()
+    tickers = normalize_tickers(args.tickers)
+    missing = []
+    if pd is None:
+        missing.append("pandas")
+    if yf is None:
+        missing.append("yfinance")
+    if missing:
+        print(
+            "Missing dependency: "
+            + ", ".join(missing)
+            + ". Install with: pip install pandas yfinance matplotlib"
+        )
+        return 1
+
     try:
-        monthly = fetch_month_end_prices(TICKERS)
+        monthly = fetch_month_end_prices(tickers)
     except RuntimeError as exc:
         print(f"Error: {exc}")
         return 1
@@ -333,7 +394,7 @@ def main():
         return 1
 
     _sma10, trend_on, momentum12 = compute_indicators(monthly)
-    decisions = simulate(monthly, trend_on, momentum12)
+    decisions = simulate(monthly, trend_on, momentum12, tickers)
     if not decisions:
         print("Not enough data to compute signals yet.")
         return 1
@@ -341,11 +402,11 @@ def main():
     latest = decisions[-1]
     date = latest["date"].strftime("%Y-%m-%d")
 
-    print("QQQM / EEM / XLE monthly rotation (month-end only)")
+    print(f"{' / '.join(tickers)} monthly rotation (month-end only)")
     print(f"As-of month-end: {date}")
     print("")
     print(f"Trend and {MOMENTUM_MONTHS}m momentum:")
-    for ticker in TICKERS:
+    for ticker in tickers:
         trend_val = latest["trend"][ticker]
         if pd.isna(trend_val):
             trend_state = "NA"
@@ -360,7 +421,7 @@ def main():
     if signal_leader is None:
         trend_on_any = any(
             pd.notna(latest["trend"][t]) and bool(latest["trend"][t])
-            for t in TICKERS
+            for t in tickers
         )
         if trend_on_any:
             print("Signal leader: none (momentum unavailable)")
@@ -407,6 +468,7 @@ def main():
             output_path,
             latest["signal_leader"],
             latest["change_event"],
+            tickers,
         )
         print(f"Chart saved: {output_path}")
 
